@@ -3,6 +3,6 @@ pytest>=8,<9
 pytest-asyncio>=0.24,<2
 pytest-cov>=5,<7
 ruff>=0.6
-jsonschema>=4.23,<5
+jsonschema>=4.26.0,<5
 openapi-spec-validator>=0.7,<1
 PyYAML>=6,<7
