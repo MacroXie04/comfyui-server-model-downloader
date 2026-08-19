@@ -1,0 +1,56 @@
+[project]
+name = "server-model-downloader"
+version = "1.0.0"
+description = "Secure, verified server-side model downloads for ComfyUI workflows"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "MacroXie04" }]
+keywords = ["comfyui", "hugging-face", "civitai", "safetensors"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Security",
+]
+dependencies = [
+  "aiohttp>=3.11.8,<4",
+  "safetensors>=0.4.2,<1",
+  "PyJWT[crypto]>=2.9,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/MacroXie04/comfyui-server-model-downloader"
+Repository = "https://github.com/MacroXie04/comfyui-server-model-downloader"
+Issues = "https://github.com/MacroXie04/comfyui-server-model-downloader/issues"
+Changelog = "https://github.com/MacroXie04/comfyui-server-model-downloader/blob/main/CHANGELOG.md"
+
+[tool.comfy]
+PublisherId = "macroxie04"
+DisplayName = "Server Model Downloader"
+requires-comfyui = ">=0.33.1"
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+addopts = "--strict-markers --strict-config"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.coverage.run]
+branch = true
+source = ["backend"]
+omit = ["backend/tests/*"]
+
+[tool.coverage.report]
+show_missing = true

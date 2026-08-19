@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a compatible and secure enhancement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or operational problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility impact
+      description: Cover authentication, provider trust, paths, formats, disk use, and API compatibility.
+    validations:
+      required: true

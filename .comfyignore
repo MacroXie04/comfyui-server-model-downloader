@@ -1,0 +1,14 @@
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+**/*.py[cod]
+backend/tests/
+frontend/tests/
+requirements-dev.txt
+package.json
+package-lock.json
+docs/development/
+coverage.xml
+htmlcov/

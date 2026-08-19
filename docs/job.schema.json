@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MacroXie04/comfyui-server-model-downloader/blob/v1.0.0/docs/job.schema.json",
+  "title": "Server Model Downloader Public Job",
+  "description": "The allowlisted job representation returned by the HTTP API.",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "filename",
+    "directory",
+    "status",
+    "bytes_downloaded",
+    "size",
+    "progress",
+    "error",
+    "sha256",
+    "created_at",
+    "updated_at",
+    "completed_at",
+    "phase",
+    "error_code",
+    "attempt",
+    "max_attempts",
+    "cancel_requested"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "name": { "type": "string" },
+    "filename": {
+      "type": "string",
+      "pattern": "^[^/\\\\]+\\.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]$"
+    },
+    "directory": {
+      "enum": [
+        "checkpoints",
+        "diffusion_models",
+        "text_encoders",
+        "clip",
+        "clip_vision",
+        "vae",
+        "loras",
+        "controlnet",
+        "upscale_models",
+        "embeddings",
+        "audio_encoders",
+        "style_models"
+      ]
+    },
+    "status": {
+      "enum": ["queued", "downloading", "completed", "failed", "cancelled"]
+    },
+    "bytes_downloaded": { "type": "integer", "minimum": 0 },
+    "size": { "type": "integer", "minimum": 1 },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "error": { "type": ["string", "null"] },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": ["string", "null"], "format": "date-time" },
+    "phase": {
+      "enum": [
+        "queued",
+        "connecting",
+        "downloading",
+        "retrying",
+        "hashing",
+        "validating",
+        "publishing",
+        "cancelling",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "error_code": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "attempt": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "max_attempts": { "type": "integer", "const": 5 },
+    "cancel_requested": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

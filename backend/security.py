@@ -11,11 +11,13 @@ import secrets
 import socket
 import stat
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+from .settings import SettingsError, normalize_origin
 
 SAFE_EXTENSIONS = (".safetensors",)
 ALLOWED_DIRECTORIES = (
@@ -168,7 +170,9 @@ def validate_source_url(url: str) -> SourceURL:
         return SourceURL(
             "civitai", url, version_id=int(match.group(1)), file_id=file_id
         )
-    raise SecurityError("only huggingface.co resolve URLs and civitai.com download URLs are allowed")
+    raise SecurityError(
+        "only huggingface.co resolve URLs and civitai.com download URLs are allowed"
+    )
 
 
 def validate_redirect_url(url: str, provider: str) -> str:
@@ -179,7 +183,10 @@ def validate_redirect_url(url: str, provider: str) -> str:
         suffixes = _CIVITAI_REDIRECT_SUFFIXES
     else:
         raise SecurityError("unknown download provider")
-    if not any(host == suffix.lstrip(".") or (suffix.startswith(".") and host.endswith(suffix)) for suffix in suffixes):
+    if not any(
+        host == suffix.lstrip(".") or (suffix.startswith(".") and host.endswith(suffix))
+        for suffix in suffixes
+    ):
         raise SecurityError(f"redirect host is not an approved {provider} CDN")
     return host
 
@@ -256,13 +263,16 @@ def ensure_state_directory(path: Path) -> Path:
     return path.resolve(strict=True)
 
 
-def resolve_model_paths(models_root: Path, directory: str, filename: str) -> tuple[Path, Path]:
+def resolve_model_paths(
+    models_root: Path, directory: str, filename: str
+) -> tuple[Path, Path]:
     directory = validate_directory(directory)
     filename = validate_filename(filename)
     root_input = Path(models_root).absolute()
-    if not root_input.exists():
-        root_input.mkdir(parents=True, mode=0o750)
-    root_mode = os.lstat(root_input).st_mode
+    try:
+        root_mode = os.lstat(root_input).st_mode
+    except FileNotFoundError as exc:
+        raise SecurityError("models root must already exist") from exc
     if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
         raise SecurityError("models root must be a real directory")
     root = root_input.resolve(strict=True)
@@ -299,9 +309,13 @@ def _b64decode(value: str) -> bytes:
 class TokenSigner:
     def __init__(self, state_directory: Path):
         self.state_directory = ensure_state_directory(state_directory)
-        self._key = self._load_or_create_key(self.state_directory / "download-token.key")
+        self._key = self._load_or_create_key(
+            self.state_directory / "download-token.key"
+        )
         self.csrf_token = _b64encode(
-            hmac.new(self._key, b"server-model-downloader-csrf-v1", hashlib.sha256).digest()
+            hmac.new(
+                self._key, b"server-model-downloader-csrf-v1", hashlib.sha256
+            ).digest()
         )
 
     @staticmethod
@@ -336,22 +350,30 @@ class TokenSigner:
         os.chmod(path, 0o600)
         return key
 
-    def sign(self, payload: Mapping[str, Any], ttl_seconds: int = 1800) -> tuple[str, int]:
+    def sign(
+        self, payload: Mapping[str, Any], ttl_seconds: int = 1800
+    ) -> tuple[str, int]:
         expires_at = int(time.time()) + ttl_seconds
         data = dict(payload)
         data.update({"v": 1, "exp": expires_at})
-        raw = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        raw = json.dumps(
+            data, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
         if len(raw) > 16_384:
             raise SecurityError("token payload is too large")
         body = _b64encode(raw)
-        signature = _b64encode(hmac.new(self._key, body.encode("ascii"), hashlib.sha256).digest())
+        signature = _b64encode(
+            hmac.new(self._key, body.encode("ascii"), hashlib.sha256).digest()
+        )
         return f"{body}.{signature}", expires_at
 
     def verify(self, token: str) -> dict[str, Any]:
         if not isinstance(token, str) or len(token) > 32_768 or token.count(".") != 1:
             raise SecurityError("malformed token")
         body, signature = token.split(".", 1)
-        expected = _b64encode(hmac.new(self._key, body.encode("ascii"), hashlib.sha256).digest())
+        expected = _b64encode(
+            hmac.new(self._key, body.encode("ascii"), hashlib.sha256).digest()
+        )
         if not hmac.compare_digest(signature, expected):
             raise SecurityError("invalid token signature")
         try:
@@ -360,12 +382,125 @@ class TokenSigner:
             raise SecurityError("malformed token payload") from exc
         if not isinstance(payload, dict) or payload.get("v") != 1:
             raise SecurityError("unsupported token version")
-        if not isinstance(payload.get("exp"), int) or payload["exp"] <= int(time.time()):
+        if not isinstance(payload.get("exp"), int) or payload["exp"] <= int(
+            time.time()
+        ):
             raise SecurityError("download token has expired")
         return payload
 
+    @staticmethod
+    def _validate_subject(subject: str) -> str:
+        if (
+            not isinstance(subject, str)
+            or not subject
+            or len(subject) > 2048
+            or any(
+                ord(character) < 32 or ord(character) == 127 for character in subject
+            )
+        ):
+            raise SecurityError("invalid authenticated subject")
+        return subject
 
-def require_same_origin_and_csrf(headers: Mapping[str, str], expected_csrf: str) -> None:
+    def _subject_binding(self, subject: str) -> str:
+        subject = self._validate_subject(subject)
+        return _b64encode(
+            hmac.new(
+                self._key,
+                b"server-model-downloader-subject-v1\x00" + subject.encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+        )
+
+    def subject_binding(self, subject: str) -> str:
+        """Return the non-reversible binding used to scope persisted state."""
+
+        return self._subject_binding(subject)
+
+    def sign_bound(
+        self,
+        payload: Mapping[str, Any],
+        subject: str,
+        *,
+        purpose: str = "download",
+        ttl_seconds: int = 1800,
+    ) -> tuple[str, int]:
+        """Sign a token that can only be used by one authenticated subject."""
+
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", purpose):
+            raise SecurityError("invalid token purpose")
+        data = dict(payload)
+        reserved = {"_smd_subject", "_smd_purpose", "v", "exp"}
+        if reserved.intersection(data):
+            raise SecurityError("token payload contains reserved fields")
+        data["_smd_subject"] = self._subject_binding(subject)
+        data["_smd_purpose"] = purpose
+        return self.sign(data, ttl_seconds=ttl_seconds)
+
+    def verify_bound(
+        self,
+        token: str,
+        subject: str,
+        *,
+        purpose: str = "download",
+    ) -> dict[str, Any]:
+        payload = self.verify(token)
+        supplied_binding = payload.get("_smd_subject")
+        if (
+            not isinstance(supplied_binding, str)
+            or not hmac.compare_digest(supplied_binding, self._subject_binding(subject))
+            or payload.get("_smd_purpose") != purpose
+        ):
+            raise SecurityError("token is not valid for this identity")
+        return payload
+
+    def sign_download(
+        self,
+        payload: Mapping[str, Any],
+        subject: str,
+        *,
+        ttl_seconds: int = 1800,
+    ) -> tuple[str, int]:
+        return self.sign_bound(
+            payload, subject, purpose="download", ttl_seconds=ttl_seconds
+        )
+
+    def verify_download(self, token: str, subject: str) -> dict[str, Any]:
+        return self.verify_bound(token, subject, purpose="download")
+
+    def issue_csrf(
+        self,
+        subject: str,
+        public_origin: str,
+        *,
+        ttl_seconds: int = 15 * 60,
+    ) -> tuple[str, int]:
+        try:
+            origin = normalize_origin(public_origin, name="public origin")
+        except SettingsError as exc:
+            raise SecurityError(str(exc)) from exc
+        return self.sign_bound(
+            {"origin": origin},
+            subject,
+            purpose="csrf",
+            ttl_seconds=ttl_seconds,
+        )
+
+    def verify_csrf(
+        self, token: str, subject: str, public_origin: str
+    ) -> dict[str, Any]:
+        try:
+            origin = normalize_origin(public_origin, name="public origin")
+        except SettingsError as exc:
+            raise SecurityError(str(exc)) from exc
+        payload = self.verify_bound(token, subject, purpose="csrf")
+        if payload.get("origin") != origin:
+            raise SecurityError("CSRF token is not valid for this origin")
+        return payload
+
+
+def require_same_origin_and_csrf(
+    headers: Mapping[str, str], expected_csrf: str
+) -> None:
     supplied = headers.get("X-SMD-CSRF", "")
     if not supplied or not hmac.compare_digest(supplied, expected_csrf):
         raise SecurityError("missing or invalid CSRF token")
@@ -376,13 +511,44 @@ def require_same_origin_and_csrf(headers: Mapping[str, str], expected_csrf: str)
     if parsed.path not in ("", "/") or parsed.query:
         raise SecurityError("invalid Origin header")
     forwarded_host = headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
-    request_host = (forwarded_host or headers.get("Host", "")).strip().lower().rstrip(".")
+    request_host = (
+        (forwarded_host or headers.get("Host", "")).strip().lower().rstrip(".")
+    )
     if not request_host:
         raise SecurityError("request Host header is required")
-    if request_host.endswith(":443"):
-        request_host = request_host[:-4]
+    request_host = request_host.removesuffix(":443")
     if origin_host != request_host:
         raise SecurityError("cross-origin request rejected")
     fetch_site = headers.get("Sec-Fetch-Site")
     if fetch_site and fetch_site not in ("same-origin", "none"):
         raise SecurityError("cross-site request rejected")
+
+
+def require_subject_origin_and_csrf(
+    headers: Mapping[str, str],
+    signer: TokenSigner,
+    subject: str,
+    public_origin: str,
+) -> dict[str, Any]:
+    """Require an exact configured Origin and a short-lived subject-bound CSRF."""
+
+    supplied = headers.get("X-SMD-CSRF", "")
+    if not supplied:
+        raise SecurityError("missing or invalid CSRF token")
+    origin = headers.get("Origin")
+    if not origin:
+        raise SecurityError("Origin header is required")
+    try:
+        actual_origin = normalize_origin(origin, name="Origin header")
+        expected_origin = normalize_origin(public_origin, name="public origin")
+    except SettingsError as exc:
+        raise SecurityError(str(exc)) from exc
+    if actual_origin != expected_origin:
+        raise SecurityError("cross-origin request rejected")
+    fetch_site = headers.get("Sec-Fetch-Site")
+    if fetch_site and fetch_site not in ("same-origin", "none"):
+        raise SecurityError("cross-site request rejected")
+    try:
+        return signer.verify_csrf(supplied, subject, expected_origin)
+    except SecurityError as exc:
+        raise SecurityError("missing or invalid CSRF token") from exc

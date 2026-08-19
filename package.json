@@ -1,0 +1,13 @@
+{
+  "name": "server-model-downloader-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check frontend/server-model-downloader.js && node --check frontend/model-scan.mjs && node --check frontend/client-state.mjs",
+    "test": "node --test frontend/tests/*.test.mjs"
+  }
+}

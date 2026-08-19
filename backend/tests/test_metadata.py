@@ -27,7 +27,11 @@ def _run(coro):  # noqa: ANN001, ANN202
     ("filename", "provider_metadata", "expected"),
     [
         ("anything.safetensors", {"repo_path": "vae/anything.safetensors"}, "vae"),
-        ("anything.safetensors", {"repo_path": "text_encoders/anything.safetensors"}, "text_encoders"),
+        (
+            "anything.safetensors",
+            {"repo_path": "text_encoders/anything.safetensors"},
+            "text_encoders",
+        ),
         ("anything.safetensors", {"model_type": "Checkpoint"}, "checkpoints"),
         ("anything.safetensors", {"model_type": "LORA"}, "loras"),
         ("anything.safetensors", {"model_type": "ControlNet"}, "controlnet"),
@@ -90,6 +94,7 @@ def test_huggingface_inspection_pins_revision_hash_size_directory_and_token(
                 ),
                 "directory": "auto",
             },
+            subject="user-1",
         )
     )
 
@@ -116,7 +121,7 @@ def test_huggingface_inspection_pins_revision_hash_size_directory_and_token(
     assert candidate["license_url"] == (
         "https://huggingface.co/Comfy-Org/z_image_turbo/blob/" + "a" * 40 + "/LICENSE"
     )
-    token = signer.verify(candidate["download_token"])
+    token = signer.verify_download(candidate["download_token"], "user-1")
     assert token["canonical_url"] == candidate["canonical_url"]
     assert token["revision"] == candidate["revision"]
     assert token["size"] == candidate["size"]
@@ -142,11 +147,69 @@ def test_huggingface_explicit_directory_overrides_inference(
                 "url": "https://huggingface.co/org/repo/resolve/main/model.safetensors",
                 "directory": "checkpoints",
             },
+            subject="user-1",
         )
     )
     assert candidate["directory"] == "checkpoints"
     assert candidate["filename"] == "renamed.safetensors"
     assert candidate["source_filename"] == "model.safetensors"
+
+
+def test_huggingface_metadata_requests_are_deduplicated_and_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    async def fake_fetch(session, url, provider):  # noqa: ANN001, ANN202
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return _hf_document()
+
+    async def exercise() -> None:
+        inspector = MetadataInspector(TokenSigner(tmp_path / "state"))
+        model = {
+            "name": "ae.safetensors",
+            "url": (
+                "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/"
+                "split_files/vae/ae.safetensors"
+            ),
+        }
+        first, second = await asyncio.gather(
+            inspector.inspect(object(), model, subject="user-1"),
+            inspector.inspect(object(), model, subject="user-1"),
+        )
+        third = await inspector.inspect(object(), model, subject="user-1")
+        assert first == second == third
+
+    monkeypatch.setattr(metadata, "safe_fetch_json", fake_fetch)
+    _run(exercise())
+    assert calls == 1
+
+
+def test_huggingface_foreign_license_link_is_not_exposed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_fetch(session, url, provider):  # noqa: ANN001, ANN202
+        return _hf_document(license_link="https://untrusted.example/collect")
+
+    monkeypatch.setattr(metadata, "safe_fetch_json", fake_fetch)
+    [candidate] = _run(
+        MetadataInspector(TokenSigner(tmp_path / "state")).inspect(
+            object(),
+            {
+                "name": "ae.safetensors",
+                "url": (
+                    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/"
+                    "split_files/vae/ae.safetensors"
+                ),
+            },
+            subject="user-1",
+        )
+    )
+    assert candidate["license_url"].startswith(
+        "https://huggingface.co/Comfy-Org/z_image_turbo/blob/"
+    )
 
 
 @pytest.mark.parametrize(
@@ -183,6 +246,7 @@ def test_huggingface_inspection_rejects_unverifiable_metadata(
                         "split_files/vae/ae.safetensors"
                     ),
                 },
+                subject="user-1",
             )
         )
 
@@ -251,6 +315,7 @@ def test_civitai_file_id_is_bound_to_metadata_url_hash_size_and_token(
                 "url": "https://civitai.com/api/download/models/123",
                 "directory": "auto",
             },
+            subject="user-1",
         )
     )
     assert calls == [
@@ -267,7 +332,7 @@ def test_civitai_file_id_is_bound_to_metadata_url_hash_size_and_token(
     assert "commercial=['Image', 'RentCivit']" in candidate["license"]
     assert "credit-required=False" in candidate["license"]
     assert candidate["license_url"] == "https://civitai.com/models/42"
-    token = signer.verify(candidate["download_token"])
+    token = signer.verify_download(candidate["download_token"], "user-1")
     assert token["canonical_url"] == candidate["canonical_url"]
     assert token["sha256"] == "c" * 64
 
@@ -294,7 +359,9 @@ def test_civitai_file_id_is_bound_to_metadata_url_hash_size_and_token(
         ),
         (
             "https://civitai.com/api/download/models/123?fileId=456",
-            _civitai_version(download_url="https://civitai.com/api/download/models/124?fileId=456"),
+            _civitai_version(
+                download_url="https://civitai.com/api/download/models/124?fileId=456"
+            ),
             "model version",
         ),
         (
@@ -338,6 +405,7 @@ def test_civitai_inspection_rejects_unbound_or_unverifiable_file_metadata(
             inspector.inspect(
                 object(),
                 {"name": "model.safetensors", "url": source_url, "directory": "auto"},
+                subject="user-1",
             )
         )
 
@@ -352,7 +420,9 @@ class _Content:
 
 
 class _Response:
-    def __init__(self, status: int, *, headers: dict[str, str] | None = None, chunks=None):  # noqa: ANN001
+    def __init__(
+        self, status: int, *, headers: dict[str, str] | None = None, chunks=None
+    ):  # noqa: ANN001
         self.status = status
         self.headers = headers or {}
         self.content = _Content(chunks or [])
@@ -399,7 +469,9 @@ def test_safe_fetch_json_revalidates_dns_and_redirect_host_each_hop(
 
     monkeypatch.setattr(metadata, "require_public_dns", fake_dns)
     result = _run(
-        safe_fetch_json(session, "https://huggingface.co/api/models/org/repo", "huggingface")
+        safe_fetch_json(
+            session, "https://huggingface.co/api/models/org/repo", "huggingface"
+        )
     )
     assert result == {"ok": True}
     assert dns_hosts == ["huggingface.co", "cdn-lfs.huggingface.co"]
@@ -430,8 +502,8 @@ def test_safe_fetch_json_rejects_bad_redirect_status_and_payload(
         )
     assert missing_location.released
 
-    error = _Response(403, chunks=[b"denied"])
-    with pytest.raises(MetadataError, match="HTTP 403"):
+    error = _Response(403, chunks=[b"secret provider response"])
+    with pytest.raises(MetadataError, match="HTTP 403") as error_info:
         _run(
             safe_fetch_json(
                 _Session([error]),
@@ -439,6 +511,7 @@ def test_safe_fetch_json_rejects_bad_redirect_status_and_payload(
                 "huggingface",
             )
         )
+    assert "secret provider response" not in str(error_info.value)
     assert error.released
 
     invalid = _Response(200, chunks=[b"not-json"])

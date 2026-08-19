@@ -1,156 +1,131 @@
-# ComfyUI Server Model Downloader
+# Server Model Downloader for ComfyUI
 
-A restricted ComfyUI extension that downloads missing workflow models directly to the ComfyUI server instead of the browser.
+[![CI](https://github.com/MacroXie04/comfyui-server-model-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/MacroXie04/comfyui-server-model-downloader/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/MacroXie04/comfyui-server-model-downloader/actions/workflows/codeql.yml/badge.svg)](https://github.com/MacroXie04/comfyui-server-model-downloader/actions/workflows/codeql.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-It adds a **Download to Server** sidebar and Extensions-menu entry, scans the active workflow for selected model metadata, resolves provider metadata, and runs verified resumable downloads on the server.
+Server Model Downloader is a security-focused ComfyUI extension that downloads missing workflow models directly to the machine running ComfyUI. It resolves provider metadata, reserves disk space, resumes interrupted transfers, verifies SHA-256 and Safetensors structure, then publishes each file without overwriting an existing model.
 
-This is a private/internal repository. Installation and use are limited to the copyright holder and people who have received explicit permission.
+The extension is **disabled by default**. It becomes available only after an administrator configures an HTTPS public origin and one of the supported authentication modes.
 
-## Security model
+![Server Model Downloader sidebar preview](docs/images/sidebar-preview.svg)
 
-This extension is intended for a single trusted administrator behind an authenticated access layer such as Cloudflare Access. It does **not** provide user authentication by itself. Keep ComfyUI bound to loopback or a private network and do not expose its HTTP service directly to the public Internet.
+## Highlights
 
-Before enabling the extension, verify all of the following:
-
-- The entire ComfyUI hostname, including `/server-model-downloader/*`, is covered by a deny-by-default Access application with no public bypass policy.
-- ComfyUI listens only on `127.0.0.1` (or another explicitly private origin interface).
-- The cloud firewall/security group has no public inbound rule for the ComfyUI port.
-- An unauthenticated request to `https://comfy.example.com/server-model-downloader/session` is redirected to the identity provider or denied; it must never return downloader JSON.
-- The reverse proxy overwrites `Host`/`X-Forwarded-Host` with trusted values. Do not pass a client-supplied `X-Forwarded-Host` through unchanged.
-
-Mutating requests require an HTTPS browser origin matching the effective host. The download page therefore intentionally rejects plain `http://127.0.0.1` SSH tunnels and plain HTTP Tailscale URLs. Use the authenticated HTTPS hostname (or provide an equivalently trusted HTTPS reverse proxy).
-
-The backend enforces the security boundary; frontend checks are only defense in depth:
-
-- HTTPS sources are limited to canonical Hugging Face and Civitai model URLs.
-- Only `.safetensors` files are accepted.
-- Destination directories come from a fixed ComfyUI model-directory allowlist.
-- The browser submits short-lived, server-signed download tokens rather than arbitrary URLs or paths.
-- Metadata requests and every redirect are revalidated, including public-IP DNS checks to reduce SSRF risk.
-- Downloads reserve 20 GiB of free space and enforce provider-reported size limits.
-- Existing destination files are never overwritten.
-- Partial files resume using HTTP ranges after a service restart.
-- SHA-256 and Safetensors structure are checked before descriptor-bound, no-replace publication.
-- Per-target filesystem locks prevent concurrent workers from publishing the same model.
-- Mutating API calls require same-origin and CSRF validation.
+- Explicit **Scan workflow** action; opening the sidebar never contacts a model provider.
+- Canonical Hugging Face and Civitai HTTPS sources only.
+- `.safetensors` files and a fixed model-directory allowlist only.
+- Cloudflare Access JWT validation or an explicitly trusted reverse proxy.
+- Identity-bound CSRF and short-lived download tokens.
+- Resumable downloads with aggregate capacity checks and a 20 GiB reserve.
+- SHA-256 and Safetensors validation before descriptor-bound, no-replace publication.
+- Retry handling for timeouts, rate limits, and transient upstream failures.
+- Download history, cancellation, and safe removal of retained partial files.
+- No separate listener or inbound port: the API is served by the existing ComfyUI process.
 
 ## Compatibility
 
-The deployed reference environment is:
+| Component | Supported |
+| --- | --- |
+| Operating system | Linux only |
+| Python | 3.10–3.13 |
+| ComfyUI | 0.33.1 or newer |
+| ComfyUI frontend | 1.48.7 or newer |
+| ComfyUI processes | One process per state/model directory |
+| Providers | Hugging Face, Civitai |
+| Model format | `.safetensors` |
 
-- Ubuntu 24.04
-- Python 3.12
-- ComfyUI `v0.33.1`
-- ComfyUI frontend `v1.48.7`
-- ComfyUI-Manager `v4.2.2`
-
-The publication path uses Linux filesystem facilities (`flock`, `linkat`, `/proc/self/fd`) and is therefore Linux-only.
+Linux is required for `flock`, `linkat`, `O_NOFOLLOW`, and descriptor-bound publication. The downloader fails closed when those guarantees are unavailable.
 
 ## Installation
 
-Clone the repository into the ComfyUI custom-nodes directory:
+After the Registry release is available, install with Comfy CLI:
+
+```bash
+comfy node install server-model-downloader
+```
+
+Or clone the repository into `custom_nodes` and install its runtime dependencies in the same Python environment as ComfyUI:
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes
-git clone git@github.com:MacroXie04/comfyui-server-model-downloader.git
-```
-
-Install the small runtime dependency set into the same Python environment ComfyUI uses, then restart ComfyUI:
-
-```bash
+git clone https://github.com/MacroXie04/comfyui-server-model-downloader.git
 /path/to/ComfyUI/.venv/bin/python -m pip install -r comfyui-server-model-downloader/requirements.txt
 ```
 
-By default, models and downloader state are stored at:
+Restart ComfyUI after configuring the extension.
 
-```text
-/srv/comfyui-data/models
-/srv/comfyui-data/user/server-model-downloader
-```
+## Configuration
 
-Create the persistent directories for the account that runs ComfyUI. Replace `comfyui:comfyui` when your service uses a different account:
+Every deployment must set `SMD_ENABLED=true`, an exact HTTPS origin, and one authentication mode. Invalid or incomplete configuration leaves only the downloader in a degraded `503` state; ComfyUI itself continues to run.
 
-```bash
-sudo install -d -o comfyui -g comfyui -m 0750 \
-  /srv/comfyui-data/models \
-  /srv/comfyui-data/user/server-model-downloader
-```
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `SMD_ENABLED` | Yes | `false` | Enables the downloader when set to `true`. |
+| `SMD_PUBLIC_ORIGIN` | Yes | — | Exact root origin, for example `https://comfy.example.com`. Paths, queries, fragments, credentials, and HTTP are rejected. |
+| `SMD_AUTH_MODE` | Yes | — | `cloudflare-access` or `trusted-proxy`. |
+| `SMD_MODELS_ROOT` | No | ComfyUI `folder_paths.models_dir` | Overrides the model root. |
+| `SMD_STATE_DIR` | No | ComfyUI system user directory plus `server_model_downloader` | Overrides private persistent state. |
+| `SMD_ALLOWED_EMAILS` | No | all authenticated identities | Comma-separated email allowlist. |
+| `SMD_CF_TEAM_DOMAIN` | Cloudflare | — | Cloudflare Access team domain, such as `example.cloudflareaccess.com`. |
+| `SMD_CF_AUDIENCE` | Cloudflare | — | Access application AUD tag. |
+| `SMD_TRUSTED_PROXY_CIDRS` | Trusted proxy | `127.0.0.0/8,::1/128` | Comma-separated proxy source networks allowed to assert identity. |
+| `SMD_TRUSTED_IDENTITY_HEADER` | Trusted proxy | `X-Forwarded-User` | Header overwritten by the trusted proxy with the authenticated identity. |
+| `HF_TOKEN` | No | — | Server-side token for private or gated Hugging Face files. |
+| `HUGGING_FACE_HUB_TOKEN` | No | — | Alternative to `HF_TOKEN`. |
+| `CIVITAI_API_TOKEN` | No | — | Server-side token for Civitai downloads that require one. |
 
-Override the locations in the ComfyUI service environment when your installation uses different paths:
+`SMD_STATE_DIR` contains resumable job state and signing material. Keep it persistent, mode `0700`, writable only by the ComfyUI service account, and out of source control. Provider credentials must be service environment variables, never workflow URLs or browser storage.
 
-```text
-SMD_MODELS_ROOT=/path/to/ComfyUI/models
-SMD_STATE_DIR=/path/to/private/persistent/state
-```
+### Cloudflare Access
 
-For a systemd service, place the values in an override such as `/etc/systemd/system/comfyui.service.d/server-model-downloader.conf`:
+Cloudflare Access is the recommended production mode:
 
 ```ini
 [Service]
-Environment="SMD_MODELS_ROOT=/srv/comfyui-data/models"
-Environment="SMD_STATE_DIR=/srv/comfyui-data/user/server-model-downloader"
+Environment="SMD_ENABLED=true"
+Environment="SMD_PUBLIC_ORIGIN=https://comfy.example.com"
+Environment="SMD_AUTH_MODE=cloudflare-access"
+Environment="SMD_CF_TEAM_DOMAIN=example.cloudflareaccess.com"
+Environment="SMD_CF_AUDIENCE=your-access-application-aud"
+Environment="SMD_ALLOWED_EMAILS=operator@example.com"
 ```
 
-Then reload and restart the service:
+The backend validates the `Cf-Access-Jwt-Assertion` signature and its issuer, audience, expiry, not-before time, and key ID. Signing keys are obtained from the team JWKS endpoint and rotated safely. Missing keys or a JWKS outage fail closed.
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart comfyui
+The Access application must cover the entire ComfyUI hostname, including both downloader API prefixes. Do not add a bypass policy for downloader routes.
+
+### Trusted reverse proxy
+
+Use this mode only when a local reverse proxy authenticates the user, strips any client-supplied identity header, and writes its own value:
+
+```ini
+[Service]
+Environment="SMD_ENABLED=true"
+Environment="SMD_PUBLIC_ORIGIN=https://comfy.example.com"
+Environment="SMD_AUTH_MODE=trusted-proxy"
+Environment="SMD_TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128"
+Environment="SMD_TRUSTED_IDENTITY_HEADER=X-Forwarded-User"
 ```
 
-For a manually started ComfyUI process, export the same variables in the shell before starting it.
-
-`SMD_STATE_DIR` contains the signing key and resumable job state. It must be persistent, writable only by the ComfyUI service account, and excluded from backups or repositories that are shared publicly.
-
-Optional provider credentials can be supplied to the ComfyUI service process:
-
-```text
-HF_TOKEN=...
-HUGGING_FACE_HUB_TOKEN=...  # accepted as an alternative to HF_TOKEN
-CIVITAI_API_TOKEN=...
-```
-
-Do not put credentials in workflow URLs, Git, or browser storage.
-
-## Post-install verification
-
-Confirm that ComfyUI loaded the browser extension and that the job list is initially available:
-
-```bash
-curl -fsS http://127.0.0.1:8188/extensions | grep comfyui_server_model_downloader
-curl -fsS http://127.0.0.1:8188/server-model-downloader/jobs
-```
-
-Check the service log for import or permission errors:
-
-```bash
-sudo journalctl -u comfyui -n 200 --no-pager
-```
-
-From a client that is not logged in to the Access application, verify the public endpoint is challenged rather than returning JSON:
-
-```bash
-curl -I https://comfy.example.com/server-model-downloader/session
-```
-
-Finally, inspect the listener and cloud firewall separately. A safe reference deployment has ComfyUI on `127.0.0.1:8188` and no inbound cloud-firewall rule for port 8188.
+Requests from outside the configured proxy networks are rejected even if they contain the identity header. Never include a public client network in `SMD_TRUSTED_PROXY_CIDRS`.
 
 ## Usage
 
-1. Open a workflow containing model metadata.
-2. Open **Extensions → AWS Model Download → Download to AWS**, or select the downloader sidebar.
-3. Choose **Scan workflow**.
-4. Review provider, immutable revision, destination, file size, SHA-256, and license.
-5. Select eligible files, confirm the license, and start the download.
-6. Monitor or cancel jobs in the same panel.
+1. Open a workflow that contains model metadata.
+2. Open **Extensions → Server Model Downloader**, or select its sidebar icon.
+3. Choose **Scan workflow**. This is the first point at which provider metadata is requested.
+4. Review the immutable revision, destination, size, SHA-256, source, and license.
+5. Select eligible models, confirm their licenses, and choose **Download selected to server**.
+6. Monitor connecting, downloading, retrying, hashing, validating, publishing, and cancellation phases in the history panel.
 
-ComfyUI's built-in missing-model buttons still download through the browser. Use this extension's panel when the file should be written directly to the server.
+Failed and cancelled downloads retain their partial files for a future resume. Use **Discard partial** when the retained data is no longer wanted.
 
-Promoted subgraph inputs are detected when the active workflow exposes their model metadata at the root. If metadata exists only on an interior promoted-input node, expand the subgraph and verify the model manually.
+ComfyUI's built-in missing-model links may download through the browser. Use this extension's sidebar when a verified file should be written on the server.
 
 ## Supported destinations
 
-The server can resolve and write only these model directories:
+Only the following subdirectories beneath the effective ComfyUI model root are allowed:
 
 ```text
 checkpoints
@@ -167,23 +142,89 @@ audio_encoders
 style_models
 ```
 
-## Development checks
+Version 1 does not write to paths declared only in `extra_model_paths.yaml`.
+
+## API
+
+ComfyUI exposes the same authenticated API under both prefixes:
+
+```text
+/server-model-downloader/*
+/api/server-model-downloader/*
+```
+
+Key endpoints are:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Authenticated readiness and degraded-state details. |
+| `GET` | `/session` | CSRF token, expiry, capabilities, version, and minimal identity. |
+| `POST` | `/inspect` | Resolve up to 50 workflow model records. |
+| `POST` | `/jobs` | Create jobs from signed download tokens. |
+| `GET` | `/jobs?limit=50&cursor=…` | Newest-first, cursor-paginated history. |
+| `GET` | `/jobs/{id}` | Read a single job. |
+| `POST` | `/jobs/{id}/cancel` | Request cancellation. |
+| `DELETE` | `/jobs/{id}/partial` | Remove a retained partial file for a failed or cancelled job. |
+
+All endpoints require authentication. Mutating methods additionally require an identity-bound `X-SMD-CSRF` token and a matching HTTPS `Origin`. Errors use `{ "error", "code", "request_id" }`; logs and responses do not expose JWTs, provider credentials, download tokens, absolute paths, or upstream response bodies.
+
+See [`docs/openapi.yaml`](docs/openapi.yaml) and [`frontend/README.md`](frontend/README.md) for the complete browser contract.
+
+## Security model
+
+The browser is not trusted to choose a destination path, resolved URL, checksum, or revision. Inspection returns a short-lived token binding the authenticated identity to server-resolved metadata. Job creation accepts that token rather than arbitrary paths or URLs.
+
+The main threats and controls are:
+
+| Threat | Control |
+| --- | --- |
+| Unauthenticated API use | Access JWT or trusted-proxy identity validation on every endpoint. |
+| Cross-site mutation | Exact HTTPS origin plus identity-bound, expiring CSRF token. |
+| SSRF and malicious redirects | Canonical provider URLs, public-IP DNS checks, and redirect revalidation. |
+| Path traversal or symlink replacement | Directory allowlist, descriptor-relative operations, `O_NOFOLLOW`, and locks. |
+| Corrupt or disguised content | Provider size/SHA metadata, SHA-256, and Safetensors parser validation. |
+| Existing-model replacement | No-replace publication with descriptor-bound `linkat`. |
+| Disk exhaustion | Aggregate reservation accounting and a 20 GiB free-space reserve. |
+| Multiple writers | State-directory singleton lock and per-target filesystem locks. |
+| Stale browser responses | AbortController cancellation plus request-generation checks. |
+
+Read [`SECURITY.md`](SECURITY.md) before operating the extension on an Internet-reachable hostname.
+
+## Troubleshooting
+
+### The panel reports that the downloader is disabled or degraded
+
+Check `/health` while authenticated and inspect the ComfyUI log. Confirm all required environment variables are present, the configured origin contains no path, and the service account can write the models and state directories.
+
+### Authentication fails behind Cloudflare Access
+
+Confirm the request includes the Access assertion, the team domain and application AUD match the dashboard, the system clock is correct, and no tunnel rule bypasses Access. A JWKS outage intentionally blocks the downloader.
+
+### Trusted-proxy identity is rejected
+
+Confirm ComfyUI sees the proxy's actual source address, that address is inside `SMD_TRUSTED_PROXY_CIDRS`, and the proxy overwrites the configured identity header.
+
+### A model is not discovered
+
+The scanner uses active node widget selections and workflow model metadata. Disabled and bypassed nodes are ignored. Metadata that exists only inside a promoted subgraph input may need to be exposed at the workflow root.
+
+### A partial file remains
+
+This is expected after cancellation or a retryable failure. Resume by submitting the same resolved model again, or use **Discard partial** after the job reaches `failed` or `cancelled`.
+
+## Development
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest -q backend/tests
+python -m pytest --cov=backend --cov-branch backend/tests
 ruff check backend
-node --test frontend/tests/model-scan.test.mjs
-node --check frontend/server-model-downloader.js
-node --check frontend/model-scan.mjs
+ruff format --check backend
+npm test
+npm run check
 ```
 
-The backend and API design are documented in more detail in [`frontend/README.md`](frontend/README.md).
-
-## Operational boundary
-
-The current job store and aggregate capacity accounting assume one ComfyUI Python process. Do not run multiple ComfyUI processes against the same model and state directories without adding a process-wide job-store and capacity lock.
+CI runs on Ubuntu with Python 3.10–3.13 and Node 20/22. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution and release requirements.
 
 ## License
 
-Copyright © 2026 Hongzhe Xie. All rights reserved. See [`LICENSE`](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).

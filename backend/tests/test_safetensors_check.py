@@ -84,7 +84,11 @@ def _write_safetensors(
     raw_header: bytes | None = None,
     declared_header_length: int | None = None,
 ) -> Path:
-    encoded = raw_header if raw_header is not None else json.dumps(header, separators=(",", ":")).encode()
+    encoded = (
+        raw_header
+        if raw_header is not None
+        else json.dumps(header, separators=(",", ":")).encode()
+    )
     length = len(encoded) if declared_header_length is None else declared_header_length
     path.write_bytes(struct.pack("<Q", length) + encoded + data)
     return path
@@ -113,17 +117,57 @@ def test_valid_safetensors_with_metadata_and_contiguous_tensors(tmp_path: Path) 
         ({"__metadata__": []}, b"", "metadata"),
         ({"x": []}, b"", "descriptor"),
         ({"x": {"dtype": "", "shape": [], "data_offsets": [0, 0]}}, b"", "dtype"),
-        ({"x": {"dtype": "NOT_A_DTYPE", "shape": [1], "data_offsets": [0, 1]}}, b"x", "dtype"),
-        ({"x": {"dtype": "F32", "shape": "1", "data_offsets": [0, 4]}}, b"\0" * 4, "shape"),
-        ({"x": {"dtype": "F32", "shape": [True], "data_offsets": [0, 4]}}, b"\0" * 4, "shape"),
-        ({"x": {"dtype": "F32", "shape": [-1], "data_offsets": [0, 4]}}, b"\0" * 4, "shape"),
-        ({"x": {"dtype": "F32", "shape": [1], "data_offsets": [0]}}, b"\0" * 4, "offset"),
-        ({"x": {"dtype": "F32", "shape": [1], "data_offsets": [True, 4]}}, b"\0" * 4, "offset"),
-        ({"x": {"dtype": "F32", "shape": [1], "data_offsets": [4, 0]}}, b"\0" * 4, "offset"),
-        ({"x": {"dtype": "F32", "shape": [1], "data_offsets": [-1, 4]}}, b"\0" * 4, "offset"),
-        ({"x": {"dtype": "F32", "shape": [1], "data_offsets": [0, 5]}}, b"\0" * 4, "offset"),
+        (
+            {"x": {"dtype": "NOT_A_DTYPE", "shape": [1], "data_offsets": [0, 1]}},
+            b"x",
+            "dtype",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": "1", "data_offsets": [0, 4]}},
+            b"\0" * 4,
+            "shape",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [True], "data_offsets": [0, 4]}},
+            b"\0" * 4,
+            "shape",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [-1], "data_offsets": [0, 4]}},
+            b"\0" * 4,
+            "shape",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [1], "data_offsets": [0]}},
+            b"\0" * 4,
+            "offset",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [1], "data_offsets": [True, 4]}},
+            b"\0" * 4,
+            "offset",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [1], "data_offsets": [4, 0]}},
+            b"\0" * 4,
+            "offset",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [1], "data_offsets": [-1, 4]}},
+            b"\0" * 4,
+            "offset",
+        ),
+        (
+            {"x": {"dtype": "F32", "shape": [1], "data_offsets": [0, 5]}},
+            b"\0" * 4,
+            "offset",
+        ),
         # Shape and dtype must agree with the claimed byte range.
-        ({"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]}}, b"\0" * 4, "shape"),
+        (
+            {"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]}},
+            b"\0" * 4,
+            "shape",
+        ),
     ],
 )
 def test_rejects_invalid_tensor_descriptors(
@@ -176,13 +220,21 @@ def test_rejects_truncated_or_non_json_headers(tmp_path: Path) -> None:
         validate_safetensors_file(too_small)
 
     huge = _write_safetensors(
-        tmp_path / "huge.safetensors", {}, b"", raw_header=b"{}", declared_header_length=MAX_HEADER_BYTES + 1
+        tmp_path / "huge.safetensors",
+        {},
+        b"",
+        raw_header=b"{}",
+        declared_header_length=MAX_HEADER_BYTES + 1,
     )
     with pytest.raises(SafeTensorsError, match="unreasonable"):
         validate_safetensors_file(huge)
 
     truncated = _write_safetensors(
-        tmp_path / "truncated.safetensors", {}, b"", raw_header=b"{}", declared_header_length=200
+        tmp_path / "truncated.safetensors",
+        {},
+        b"",
+        raw_header=b"{}",
+        declared_header_length=200,
     )
     with pytest.raises(SafeTensorsError, match="exceeds"):
         validate_safetensors_file(truncated)
