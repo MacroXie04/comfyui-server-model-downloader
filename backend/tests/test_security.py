@@ -150,8 +150,16 @@ def test_validate_source_url_rejects_unsafe_or_noncanonical_urls(url: str) -> No
     ("url", "provider", "host"),
     [
         ("https://huggingface.co/file", "huggingface", "huggingface.co"),
-        ("https://cdn-lfs.huggingface.co/file", "huggingface", "cdn-lfs.huggingface.co"),
-        ("https://cas-bridge.xethub.hf.co/file", "huggingface", "cas-bridge.xethub.hf.co"),
+        (
+            "https://cdn-lfs.huggingface.co/file",
+            "huggingface",
+            "cdn-lfs.huggingface.co",
+        ),
+        (
+            "https://cas-bridge.xethub.hf.co/file",
+            "huggingface",
+            "cas-bridge.xethub.hf.co",
+        ),
         ("https://civitai.com/file", "civitai", "civitai.com"),
         ("https://download.civitai.com/file", "civitai", "download.civitai.com"),
     ],
@@ -295,10 +303,19 @@ def test_validate_sha256_normalizes_and_requires_full_digest() -> None:
 
 
 def test_resolve_model_paths_creates_only_allowlisted_child(tmp_path: Path) -> None:
-    final, partial = resolve_model_paths(tmp_path / "models", "vae", "ae.safetensors")
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    final, partial = resolve_model_paths(models_root, "vae", "ae.safetensors")
     assert final == tmp_path / "models" / "vae" / "ae.safetensors"
     assert partial == tmp_path / "models" / "vae" / "ae.safetensors.part"
     assert final.parent.is_dir()
+
+
+def test_resolve_model_paths_never_creates_the_models_root(tmp_path: Path) -> None:
+    models_root = tmp_path / "missing-models"
+    with pytest.raises(SecurityError, match="must already exist"):
+        resolve_model_paths(models_root, "vae", "ae.safetensors")
+    assert not models_root.exists()
 
 
 def test_resolve_model_paths_rejects_symlinked_root(tmp_path: Path) -> None:
@@ -348,7 +365,9 @@ def test_ensure_state_directory_rejects_symlink(tmp_path: Path) -> None:
 def test_token_round_trip_tamper_and_key_permissions(tmp_path: Path) -> None:
     signer = TokenSigner(tmp_path / "state")
     payload = {
-        "canonical_url": "https://huggingface.co/org/repo/resolve/" + "a" * 40 + "/m.safetensors",
+        "canonical_url": "https://huggingface.co/org/repo/resolve/"
+        + "a" * 40
+        + "/m.safetensors",
         "directory": "vae",
         "filename": "m.safetensors",
         "size": 4,
@@ -412,10 +431,22 @@ def test_same_origin_and_csrf_accepts_cloudflare_forwarded_host() -> None:
     "headers",
     [
         {},
-        {"X-SMD-CSRF": "wrong", "Origin": "https://comfy.example.com", "Host": "comfy.example.com"},
+        {
+            "X-SMD-CSRF": "wrong",
+            "Origin": "https://comfy.example.com",
+            "Host": "comfy.example.com",
+        },
         {"X-SMD-CSRF": "csrf", "Host": "comfy.example.com"},
-        {"X-SMD-CSRF": "csrf", "Origin": "http://comfy.example.com", "Host": "comfy.example.com"},
-        {"X-SMD-CSRF": "csrf", "Origin": "https://evil.example", "Host": "comfy.example.com"},
+        {
+            "X-SMD-CSRF": "csrf",
+            "Origin": "http://comfy.example.com",
+            "Host": "comfy.example.com",
+        },
+        {
+            "X-SMD-CSRF": "csrf",
+            "Origin": "https://evil.example",
+            "Host": "comfy.example.com",
+        },
         {
             "X-SMD-CSRF": "csrf",
             "Origin": "https://comfy.example.com/path",

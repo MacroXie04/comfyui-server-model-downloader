@@ -7,8 +7,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
+coverage*.json
+coverage.xml
 htmlcov/
 node_modules/
+node.zip
 
 # Runtime state and resumable downloads must never enter source control.
 download-token.key

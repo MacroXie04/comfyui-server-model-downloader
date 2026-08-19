@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible non-security defect.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not report vulnerabilities here. Use the private security reporting flow described in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Extension version
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, Python, ComfyUI, frontend, and authentication mode.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use public test models and remove credentials and signed tokens.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted logs
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, JWTs, download tokens, private URLs, and absolute production paths.
+          required: true

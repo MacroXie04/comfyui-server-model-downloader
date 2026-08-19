@@ -361,6 +361,21 @@
   margin-bottom: 0.55rem;
 }
 
+.smd-job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.smd-load-more {
+  align-self: center;
+  min-width: 10rem;
+}
+
+.smd-session-identity {
+  overflow-wrap: anywhere;
+}
+
 .smd-empty {
   padding: 1rem 0.75rem;
   border: 1px dashed var(--smd-border);

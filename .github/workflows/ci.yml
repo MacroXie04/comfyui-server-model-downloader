@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Compile Python
+        run: python -m compileall -q __init__.py backend
+      - name: Run backend tests
+        run: python -m pytest -q backend/tests
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Measure coverage
+        run: python -m pytest -q --cov=backend --cov-branch --cov-report=json:coverage.json --cov-report=term backend/tests
+      - name: Enforce line and branch thresholds
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          totals = json.loads(Path("coverage.json").read_text())["totals"]
+          line_rate = 100 * totals["covered_lines"] / max(1, totals["num_statements"])
+          branch_rate = 100 * totals["covered_branches"] / max(1, totals["num_branches"])
+          print(f"line coverage: {line_rate:.2f}%")
+          print(f"branch coverage: {branch_rate:.2f}%")
+          if line_rate < 85 or branch_rate < 75:
+              raise SystemExit("coverage is below 85% lines or 75% branches")
+          PY
+
+  quality:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Ruff
+        run: python -m pip install --disable-pip-version-check "ruff>=0.6"
+      - name: Lint Python
+        run: ruff check backend __init__.py
+      - name: Check Python formatting
+        run: ruff format --check backend __init__.py
+
+  frontend:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run frontend tests
+        run: npm test
+      - name: Check JavaScript syntax
+        run: npm run check
+
+  linux-publication:
+    name: Linux linkat
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Exercise descriptor-bound publication
+        run: python -m pytest -q backend/tests/test_jobs.py -k 'source_name_replacement_during_link or publication_is_atomic'
+
+  registry-package:
+    name: Registry package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned Comfy CLI
+        run: python -m pip install --disable-pip-version-check comfy-cli==1.16.0
+      - name: Build Registry archive
+        run: |
+          comfy --skip-prompt --no-enable-telemetry env
+          comfy node pack
+      - name: Verify archive contents
+        run: |
+          unzip -t node.zip
+          unzip -Z1 node.zip > archive-files.txt
+          grep -Fx '__init__.py' archive-files.txt
+          grep -Fx 'frontend/server-model-downloader.js' archive-files.txt
+          grep -Fx 'backend/api.py' archive-files.txt
+          if grep -Eq '(^|/)(tests|\.github)/' archive-files.txt; then
+            echo 'Registry archive contains development-only files' >&2
+            exit 1
+          fi
+
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs: [python-tests, coverage, quality, frontend, linux-publication, registry-package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every check
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          test "$RESULTS" = "success,success,success,success,success,success"

@@ -11,6 +11,9 @@ import logging
 import os
 import re
 import stat
+import time
+import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -27,6 +30,12 @@ try:  # ``server`` only exists inside a running ComfyUI process.
 except ImportError:  # pragma: no cover - normal outside ComfyUI.
     _PromptServer = None
 
+from .auth import (
+    AuthenticationError,
+    Authenticator,
+    Identity,
+)
+from .jobs import JobError
 from .metadata import MetadataError, MetadataInspector
 from .safetensors_check import SafeTensorsError, validate_safetensors_file
 from .security import (
@@ -34,26 +43,25 @@ from .security import (
     SAFE_EXTENSIONS,
     SecurityError,
     TokenSigner,
-    require_same_origin_and_csrf,
+    require_subject_origin_and_csrf,
     resolve_model_paths,
 )
-
+from .settings import RuntimeSettings, SettingsState, load_runtime_settings
 
 LOGGER = logging.getLogger(__name__)
 
 API_PREFIX = "/server-model-downloader"
+API_COMPAT_PREFIX = f"/api{API_PREFIX}"
+API_VERSION = "1"
+EXTENSION_VERSION = "1.0.0"
 MAX_BODY_BYTES = 1024 * 1024
-MAX_MODELS_PER_INSPECTION = 256
+MAX_MODELS_PER_INSPECTION = 50
 MAX_JOBS_PER_REQUEST = 20
 MAX_JOB_ID_BYTES = 128
+INSPECTION_CONCURRENCY = 4
+INSPECTION_DEADLINE_SECONDS = 60
+INSPECTIONS_PER_IDENTITY_PER_MINUTE = 10
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-
-DEFAULT_MODELS_ROOT = Path(
-    os.environ.get("SMD_MODELS_ROOT", "/srv/comfyui-data/models")
-)
-DEFAULT_STATE_DIRECTORY = Path(
-    os.environ.get("SMD_STATE_DIR", "/srv/comfyui-data/user/server-model-downloader")
-)
 
 
 class APIError(ValueError):
@@ -100,11 +108,11 @@ def _json_response(
     return _web.json_response(data, status=status, headers=response_headers)
 
 
-def _error_response(error: APIError) -> Any:
+def _error_response(error: APIError, request_id: str) -> Any:
     return _json_response(
-        {"error": error.message, "code": error.code},
+        {"error": error.message, "code": error.code, "request_id": request_id},
         status=error.status,
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "no-store", "X-Request-ID": request_id},
     )
 
 
@@ -114,19 +122,39 @@ Handler = TypeVar("Handler", bound=Callable[..., Awaitable[Any]])
 def _endpoint(handler: Handler) -> Handler:
     """Convert every route failure into the same JSON error envelope."""
 
-    async def guarded(self: "ServerModelDownloaderAPI", request: Any) -> Any:
+    async def guarded(self: ServerModelDownloaderAPI, request: Any) -> Any:
+        request_id = uuid.uuid4().hex
         try:
-            return await handler(self, request)
+            response = await handler(self, request)
+            response.headers["X-Request-ID"] = request_id
+            return response
         except APIError as exc:
-            return _error_response(exc)
+            return _error_response(exc, request_id)
+        except AuthenticationError as exc:
+            return _error_response(APIError(exc.status, exc.code, str(exc)), request_id)
         except KeyError:
-            return _error_response(APIError(404, "not_found", "download job not found"))
-        except (SecurityError, MetadataError, ValueError, TypeError) as exc:
-            return _error_response(APIError(400, "invalid_request", str(exc)))
-        except Exception:
-            LOGGER.exception("Unhandled server model downloader API error")
             return _error_response(
-                APIError(500, "internal_error", "internal server error")
+                APIError(404, "not_found", "download job not found"), request_id
+            )
+        except (SecurityError, MetadataError, JobError) as exc:
+            return _error_response(
+                APIError(400, "invalid_request", str(exc)), request_id
+            )
+        except (ValueError, TypeError):
+            return _error_response(
+                APIError(400, "invalid_request", "invalid request"), request_id
+            )
+        except Exception as exc:
+            # Do not emit exception messages or tracebacks: OSError strings can
+            # contain absolute paths and upstream libraries may embed secrets.
+            LOGGER.error(
+                "Unhandled Server Model Downloader API error type=%s request_id=%s",
+                type(exc).__name__,
+                request_id,
+            )
+            return _error_response(
+                APIError(500, "internal_error", "internal server error"),
+                request_id,
             )
 
     guarded.__name__ = handler.__name__
@@ -253,6 +281,11 @@ _PUBLIC_JOB_FIELDS = (
     "created_at",
     "updated_at",
     "completed_at",
+    "phase",
+    "error_code",
+    "attempt",
+    "max_attempts",
+    "cancel_requested",
 )
 
 
@@ -264,13 +297,11 @@ def _job_to_dict(job: Any) -> dict[str, Any]:
             value = method()
             break
     else:
-        if dataclasses.is_dataclass(job) and not isinstance(job, type):
-            value = {
-                field: getattr(job, field)
-                for field in _PUBLIC_JOB_FIELDS
-                if hasattr(job, field)
-            }
-        elif not isinstance(job, Mapping):
+        if (
+            dataclasses.is_dataclass(job)
+            and not isinstance(job, type)
+            or not isinstance(job, Mapping)
+        ):
             value = {
                 field: getattr(job, field)
                 for field in _PUBLIC_JOB_FIELDS
@@ -307,31 +338,138 @@ def _jobs_to_list(value: Any) -> list[dict[str, Any]]:
     return [_job_to_dict(job) for job in value]
 
 
+class _InspectionRateLimiter:
+    """Small in-memory per-identity limiter for provider metadata scans."""
+
+    def __init__(
+        self,
+        limit: int = INSPECTIONS_PER_IDENTITY_PER_MINUTE,
+        window_seconds: float = 60.0,
+    ) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._events: dict[str, deque[float]] = {}
+        self._lock: asyncio.Lock | None = None
+
+    async def require_capacity(self, subject: str) -> None:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        now = time.monotonic()
+        async with self._lock:
+            events = self._events.setdefault(subject, deque())
+            cutoff = now - self.window_seconds
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if len(events) >= self.limit:
+                raise APIError(
+                    429,
+                    "rate_limited",
+                    "too many model inspections; retry later",
+                )
+            events.append(now)
+            if len(self._events) > 1024:
+                stale: list[str] = []
+                for key, values in self._events.items():
+                    while values and values[0] <= cutoff:
+                        values.popleft()
+                    if not values:
+                        stale.append(key)
+                for key in stale:
+                    self._events.pop(key, None)
+                while len(self._events) > 1024:
+                    oldest = min(
+                        self._events,
+                        key=lambda key: self._events[key][-1],
+                    )
+                    self._events.pop(oldest, None)
+
+
 class _Runtime:
     def __init__(
         self,
-        models_root: Path,
-        state_directory: Path,
+        settings_state: SettingsState,
         *,
         signer: TokenSigner | None = None,
+        authenticator: Authenticator | None = None,
         job_manager: Any | None = None,
         job_manager_factory: Callable[..., Any] | None = None,
     ) -> None:
-        self.models_root = Path(models_root).absolute()
-        self.state_directory = Path(state_directory).absolute()
+        self.settings_state = settings_state
+        self.settings = settings_state.settings
         self._signer = signer
+        self._authenticator = authenticator
         self._inspector = MetadataInspector(signer) if signer is not None else None
         self._job_manager = job_manager
         self._job_manager_factory = job_manager_factory
-        self._manager_started = False
         self._manager_lock: asyncio.Lock | None = None
+        self._startup_error: str | None = None
+
+    @property
+    def models_root(self) -> Path:
+        if self.settings is None or self.settings.models_root is None:
+            raise APIError(503, "service_unavailable", "downloader is unavailable")
+        return self.settings.models_root
+
+    @property
+    def state_directory(self) -> Path:
+        if self.settings is None or self.settings.state_directory is None:
+            raise APIError(503, "service_unavailable", "downloader is unavailable")
+        return self.settings.state_directory
+
+    def require_configured(self) -> RuntimeSettings:
+        if self.settings_state.error is not None:
+            raise APIError(
+                503,
+                "configuration_error",
+                "downloader configuration is invalid",
+            )
+        if self.settings is None or not self.settings.enabled:
+            raise APIError(503, "service_disabled", "downloader is disabled")
+        return self.settings
+
+    def require_operational(self) -> RuntimeSettings:
+        settings = self.require_configured()
+        if self._startup_error is not None:
+            raise APIError(
+                503,
+                "service_degraded",
+                "download worker is degraded",
+            )
+        manager = self._job_manager
+        health = getattr(manager, "health", None) if manager is not None else None
+        if callable(health):
+            try:
+                state = health()
+            except Exception:
+                self._startup_error = "manager health check failed"
+                raise APIError(
+                    503,
+                    "service_degraded",
+                    "download worker is degraded",
+                ) from None
+            if isinstance(state, Mapping) and state.get("status") == "degraded":
+                self._startup_error = "manager reported degraded"
+                raise APIError(
+                    503,
+                    "service_degraded",
+                    "download worker is degraded",
+                )
+        return settings
 
     @property
     def signer(self) -> TokenSigner:
+        self.require_configured()
         if self._signer is None:
             self._signer = TokenSigner(self.state_directory)
             self._inspector = MetadataInspector(self._signer)
         return self._signer
+
+    @property
+    def authenticator(self) -> Authenticator:
+        settings = self.require_configured()
+        if self._authenticator is None:
+            self._authenticator = Authenticator(settings)
+        return self._authenticator
 
     @property
     def inspector(self) -> MetadataInspector:
@@ -372,59 +510,203 @@ class _Runtime:
         return factory(**kwargs)
 
     async def job_manager(self) -> Any:
+        self.require_operational()
         if self._manager_lock is None:
             self._manager_lock = asyncio.Lock()
         async with self._manager_lock:
             if self._job_manager is None:
-                self._job_manager = self._new_job_manager()
-            if not self._manager_started:
-                ensure_started = getattr(self._job_manager, "ensure_started", None)
-                if not callable(ensure_started):
+                try:
+                    self._job_manager = self._new_job_manager()
+                except (JobError, OSError, SecurityError) as exc:
+                    self._startup_error = type(exc).__name__
                     raise APIError(
                         503,
-                        "service_unavailable",
-                        "download worker cannot be started",
-                    )
+                        "service_degraded",
+                        "download worker could not be initialized",
+                    ) from exc
+            ensure_started = getattr(self._job_manager, "ensure_started", None)
+            if not callable(ensure_started):
+                self._startup_error = "missing worker lifecycle"
+                raise APIError(
+                    503,
+                    "service_degraded",
+                    "download worker cannot be started",
+                )
+            try:
                 await _maybe_await(ensure_started())
-                self._manager_started = True
+            except (JobError, OSError, SecurityError) as exc:
+                self._startup_error = type(exc).__name__
+                raise APIError(
+                    503,
+                    "service_degraded",
+                    "download worker could not be started",
+                ) from exc
             return self._job_manager
+
+    async def startup(self) -> None:
+        try:
+            self.require_configured()
+            await self.job_manager()
+        except (APIError, AuthenticationError, OSError, SecurityError, JobError) as exc:
+            if isinstance(exc, APIError) and exc.code in {
+                "service_disabled",
+                "configuration_error",
+            }:
+                return
+            self._startup_error = type(exc).__name__
+            LOGGER.error(
+                "Server Model Downloader entered degraded state during startup (%s)",
+                type(exc).__name__,
+            )
+
+    async def shutdown(self) -> None:
+        manager = self._job_manager
+        if manager is None:
+            return
+        stop = getattr(manager, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            await asyncio.wait_for(_maybe_await(stop()), timeout=30)
+        except asyncio.TimeoutError:
+            LOGGER.error("Server Model Downloader shutdown timed out")
+        except Exception as exc:
+            LOGGER.error(
+                "Server Model Downloader shutdown failed (%s)", type(exc).__name__
+            )
+
+    def health(self) -> tuple[dict[str, Any], int]:
+        if self.settings_state.error is not None:
+            return {
+                "status": "degraded",
+                "state": "configuration-error",
+                "reason": "downloader configuration is invalid",
+            }, 503
+        if self.settings is None or not self.settings.enabled:
+            return {
+                "status": "degraded",
+                "state": "disabled",
+                "reason": "downloader is disabled",
+            }, 503
+        if self._startup_error is not None:
+            return {
+                "status": "degraded",
+                "state": "degraded",
+                "reason": "download worker is unavailable",
+            }, 503
+        manager = self._job_manager
+        health = getattr(manager, "health", None) if manager is not None else None
+        if callable(health):
+            value = health()
+            if isinstance(value, Mapping):
+                document = {
+                    key: value[key]
+                    for key in (
+                        "status",
+                        "state",
+                        "worker_running",
+                        "instance_lock_acquired",
+                        "queued_jobs",
+                        "quarantined_state",
+                    )
+                    if key in value
+                }
+                if value.get("reason") or value.get("last_worker_error"):
+                    document["reason"] = "download worker is degraded"
+                status = 503 if document.get("status") == "degraded" else 200
+                return document, status
+        return {"status": "ok", "state": "ready"}, 200
 
 
 class ServerModelDownloaderAPI:
     def __init__(
         self,
         *,
-        models_root: Path = DEFAULT_MODELS_ROOT,
-        state_directory: Path = DEFAULT_STATE_DIRECTORY,
+        settings_state: SettingsState | None = None,
+        settings: RuntimeSettings | None = None,
         signer: TokenSigner | None = None,
+        authenticator: Authenticator | None = None,
         job_manager: Any | None = None,
         job_manager_factory: Callable[..., Any] | None = None,
     ) -> None:
+        if settings_state is not None and settings is not None:
+            raise TypeError("provide settings or settings_state, not both")
+        if settings_state is None:
+            settings_state = (
+                SettingsState(settings)
+                if settings is not None
+                else load_runtime_settings()
+            )
         self.runtime = _Runtime(
-            models_root,
-            state_directory,
+            settings_state,
             signer=signer,
+            authenticator=authenticator,
             job_manager=job_manager,
             job_manager_factory=job_manager_factory,
         )
+        self._inspection_semaphore = asyncio.Semaphore(INSPECTION_CONCURRENCY)
+        self._inspection_rate_limiter = _InspectionRateLimiter()
 
-    async def _require_mutation_authority(self, request: Any) -> None:
+    async def _authenticate(self, request: Any) -> Identity:
+        self.runtime.require_configured()
+        return await self.runtime.authenticator.authenticate_request(request)
+
+    async def _require_mutation_authority(
+        self, request: Any, identity: Identity
+    ) -> None:
+        settings = self.runtime.require_operational()
+        assert settings.public_origin is not None
         try:
-            require_same_origin_and_csrf(
-                request.headers, self.runtime.signer.csrf_token
+            require_subject_origin_and_csrf(
+                request.headers,
+                self.runtime.signer,
+                identity.subject,
+                settings.public_origin,
             )
         except SecurityError as exc:
-            raise APIError(403, "forbidden", str(exc)) from exc
+            raise APIError(403, "forbidden", "request authorization failed") from exc
 
     @_endpoint
     async def session(self, request: Any) -> Any:
-        del request
+        identity = await self._authenticate(request)
+        settings = self.runtime.require_operational()
+        assert settings.public_origin is not None
+        csrf_token, csrf_expires_at = self.runtime.signer.issue_csrf(
+            identity.subject, settings.public_origin
+        )
         return _json_response(
             {
-                "csrf_token": self.runtime.signer.csrf_token,
+                "api_version": API_VERSION,
+                "extension_version": EXTENSION_VERSION,
+                "csrf_token": csrf_token,
+                "csrf_expires_at": csrf_expires_at,
                 "allowed_directories": list(ALLOWED_DIRECTORIES),
                 "safe_extensions": list(SAFE_EXTENSIONS),
+                "capabilities": {
+                    "providers": ["huggingface", "civitai"],
+                    "resume": True,
+                    "sha256": True,
+                    "discard_partial": True,
+                    "max_models_per_scan": MAX_MODELS_PER_INSPECTION,
+                    "single_process": True,
+                },
+                "identity": identity.as_public_dict(),
             },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @_endpoint
+    async def health(self, request: Any) -> Any:
+        identity = await self._authenticate(request)
+        del identity
+        document, status = self.runtime.health()
+        return _json_response(
+            {
+                "api_version": API_VERSION,
+                "extension_version": EXTENSION_VERSION,
+                **document,
+            },
+            status=status,
             headers={"Cache-Control": "no-store"},
         )
 
@@ -508,7 +790,10 @@ class ServerModelDownloaderAPI:
                             await asyncio.to_thread(
                                 validate_safetensors_file, final_path
                             )
-                        except (OSError, SecurityError, SafeTensorsError) as exc:
+                        except OSError:
+                            conflicting_file = True
+                            verification_reason = "filesystem verification failed"
+                        except (SecurityError, SafeTensorsError) as exc:
                             conflicting_file = True
                             verification_reason = str(exc)
                         else:
@@ -530,7 +815,11 @@ class ServerModelDownloaderAPI:
                         "eligible": False,
                         "reason": (
                             "an existing file could not be verified"
-                            + (f": {verification_reason}" if verification_reason else "")
+                            + (
+                                f": {verification_reason}"
+                                if verification_reason
+                                else ""
+                            )
                             + "; move or remove it manually before downloading"
                         ),
                         "download_token": None,
@@ -568,9 +857,53 @@ class ServerModelDownloaderAPI:
         ).hexdigest()[:24]
         return result
 
+    async def _inspect_one(
+        self,
+        session: Any,
+        model: Any,
+        index: int,
+        identity: Identity,
+    ) -> list[dict[str, Any]]:
+        async with self._inspection_semaphore:
+            try:
+                if not isinstance(model, Mapping):
+                    raise MetadataError("each model must be an object")
+                candidates = await self.runtime.inspector.inspect(
+                    session,
+                    model,
+                    subject=identity.subject,
+                )
+                return [
+                    await self._publish_candidate(candidate, model)
+                    for candidate in candidates
+                ]
+            except (SecurityError, MetadataError) as exc:
+                return [self._failed_model(model, index, str(exc))]
+            except (TypeError, ValueError):
+                return [
+                    self._failed_model(
+                        model,
+                        index,
+                        "model metadata is invalid",
+                    )
+                ]
+            except Exception as exc:
+                LOGGER.error(
+                    "Model metadata inspection failed (%s)", type(exc).__name__
+                )
+                return [
+                    self._failed_model(
+                        model,
+                        index,
+                        "provider metadata inspection failed",
+                    )
+                ]
+
     @_endpoint
     async def inspect_models(self, request: Any) -> Any:
-        await self._require_mutation_authority(request)
+        identity = await self._authenticate(request)
+        await self._require_mutation_authority(request, identity)
+        await self._inspection_rate_limiter.require_capacity(identity.subject)
         body = await _read_json_body(request)
         if not isinstance(body, Mapping):
             raise APIError(400, "invalid_request", "JSON body must be an object")
@@ -584,44 +917,46 @@ class ServerModelDownloaderAPI:
                 f"at most {MAX_MODELS_PER_INSPECTION} models may be inspected",
             )
         if not models:
-            return _json_response(
-                {"models": []}, headers={"Cache-Control": "no-store"}
-            )
+            return _json_response({"models": []}, headers={"Cache-Control": "no-store"})
         if _aiohttp is None:
             raise APIError(
                 503, "service_unavailable", "aiohttp is unavailable on this server"
             )
 
         timeout = _aiohttp.ClientTimeout(
-            total=90, connect=10, sock_connect=10, sock_read=30
+            total=INSPECTION_DEADLINE_SECONDS,
+            connect=10,
+            sock_connect=10,
+            sock_read=30,
         )
-        inspected: list[dict[str, Any]] = []
         async with _aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
-            for index, model in enumerate(models):
-                try:
-                    candidates = await self.runtime.inspector.inspect(session, model)
-                    if not isinstance(model, Mapping):
-                        raise MetadataError("each model must be an object")
-                    for candidate in candidates:
-                        inspected.append(
-                            await self._publish_candidate(candidate, model)
-                        )
-                except (SecurityError, MetadataError, TypeError, ValueError) as exc:
-                    inspected.append(self._failed_model(model, index, str(exc)))
-                except Exception:
-                    LOGGER.exception("Model metadata inspection failed")
-                    inspected.append(
-                        self._failed_model(
-                            model, index, "provider metadata inspection failed"
-                        )
-                    )
+            tasks = [
+                asyncio.create_task(self._inspect_one(session, model, index, identity))
+                for index, model in enumerate(models)
+            ]
+            try:
+                groups = await asyncio.wait_for(
+                    asyncio.gather(*tasks),
+                    timeout=INSPECTION_DEADLINE_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise APIError(
+                    504,
+                    "inspection_timeout",
+                    "model inspection exceeded its 60 second deadline",
+                ) from exc
+        inspected = [item for group in groups for item in group]
         return _json_response(
             {"models": inspected}, headers={"Cache-Control": "no-store"}
         )
 
     @_endpoint
     async def create_jobs(self, request: Any) -> Any:
-        await self._require_mutation_authority(request)
+        identity = await self._authenticate(request)
+        await self._require_mutation_authority(request, identity)
         body = await _read_json_body(request)
         if not isinstance(body, Mapping):
             raise APIError(400, "invalid_request", "JSON body must be an object")
@@ -648,7 +983,7 @@ class ServerModelDownloaderAPI:
             )
 
         manager = await self.runtime.job_manager()
-        jobs = await _maybe_await(manager.create_jobs(tokens, True))
+        jobs = await _maybe_await(manager.create_jobs(tokens, True, identity.subject))
         return _json_response(
             {"jobs": _jobs_to_list(jobs)},
             status=202,
@@ -657,19 +992,44 @@ class ServerModelDownloaderAPI:
 
     @_endpoint
     async def list_jobs(self, request: Any) -> Any:
-        del request
+        identity = await self._authenticate(request)
         manager = await self.runtime.job_manager()
-        jobs = await _maybe_await(manager.list_jobs())
+        query = getattr(request, "query", {})
+        raw_limit = query.get("limit", "50") if isinstance(query, Mapping) else "50"
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError) as exc:
+            raise APIError(400, "invalid_limit", "limit must be an integer") from exc
+        cursor = query.get("cursor") if isinstance(query, Mapping) else None
+        if cursor is not None and not isinstance(cursor, str):
+            raise APIError(400, "invalid_cursor", "cursor must be a string")
+        history = getattr(manager, "list_job_history", None)
+        if callable(history):
+            page = await _maybe_await(
+                history(identity.subject, cursor=cursor, limit=limit)
+            )
+        else:
+            page = {
+                "jobs": await _maybe_await(manager.list_jobs(identity.subject)),
+                "next_cursor": None,
+            }
+        if not isinstance(page, Mapping):
+            raise TypeError("job manager returned an invalid history page")
         return _json_response(
-            {"jobs": _jobs_to_list(jobs)}, headers={"Cache-Control": "no-store"}
+            {
+                "jobs": _jobs_to_list(page.get("jobs")),
+                "next_cursor": page.get("next_cursor"),
+            },
+            headers={"Cache-Control": "no-store"},
         )
 
     @_endpoint
     async def get_job(self, request: Any) -> Any:
+        identity = await self._authenticate(request)
         job_id = _validate_job_id(request.match_info.get("job_id"))
         manager = await self.runtime.job_manager()
         try:
-            job = await _maybe_await(manager.get_job(job_id))
+            job = await _maybe_await(manager.get_job(job_id, identity.subject))
         except ValueError as exc:
             if "not found" in str(exc).lower():
                 raise APIError(404, "not_found", "download job not found") from exc
@@ -682,14 +1042,15 @@ class ServerModelDownloaderAPI:
 
     @_endpoint
     async def cancel_job(self, request: Any) -> Any:
-        await self._require_mutation_authority(request)
+        identity = await self._authenticate(request)
+        await self._require_mutation_authority(request, identity)
         body = await _read_json_body(request)
         if not isinstance(body, Mapping):
             raise APIError(400, "invalid_request", "JSON body must be an object")
         job_id = _validate_job_id(request.match_info.get("job_id"))
         manager = await self.runtime.job_manager()
         try:
-            job = await _maybe_await(manager.cancel_job(job_id))
+            job = await _maybe_await(manager.cancel_job(job_id, identity.subject))
         except ValueError as exc:
             if "not found" in str(exc).lower():
                 raise APIError(404, "not_found", "download job not found") from exc
@@ -697,7 +1058,7 @@ class ServerModelDownloaderAPI:
         if job is None or job is False:
             raise APIError(404, "not_found", "download job not found")
         if job is True:
-            job = await _maybe_await(manager.get_job(job_id))
+            job = await _maybe_await(manager.get_job(job_id, identity.subject))
         if job is None:
             raise APIError(404, "not_found", "download job not found")
         return _json_response(
@@ -706,13 +1067,36 @@ class ServerModelDownloaderAPI:
             headers={"Cache-Control": "no-store"},
         )
 
+    @_endpoint
+    async def discard_partial(self, request: Any) -> Any:
+        identity = await self._authenticate(request)
+        await self._require_mutation_authority(request, identity)
+        job_id = _validate_job_id(request.match_info.get("job_id"))
+        manager = await self.runtime.job_manager()
+        discard = getattr(manager, "discard_partial", None)
+        if not callable(discard):
+            raise APIError(
+                503,
+                "service_degraded",
+                "partial cleanup is unavailable",
+            )
+        try:
+            job = await _maybe_await(discard(job_id, identity.subject))
+        except KeyError as exc:
+            raise APIError(404, "not_found", "download job not found") from exc
+        return _json_response(
+            {"job": _job_to_dict(job)},
+            headers={"Cache-Control": "no-store"},
+        )
+
 
 def register_routes(
     prompt_server: Any | None = None,
     *,
-    models_root: Path = DEFAULT_MODELS_ROOT,
-    state_directory: Path = DEFAULT_STATE_DIRECTORY,
+    settings_state: SettingsState | None = None,
+    settings: RuntimeSettings | None = None,
     signer: TokenSigner | None = None,
+    authenticator: Authenticator | None = None,
     job_manager: Any | None = None,
     job_manager_factory: Callable[..., Any] | None = None,
 ) -> ServerModelDownloaderAPI:
@@ -722,25 +1106,52 @@ def register_routes(
         if _PromptServer is None or getattr(_PromptServer, "instance", None) is None:
             raise RuntimeError("ComfyUI PromptServer is unavailable")
         prompt_server = _PromptServer.instance
+    existing = getattr(prompt_server, "_server_model_downloader_api", None)
+    if isinstance(existing, ServerModelDownloaderAPI):
+        return existing
     routes = getattr(prompt_server, "routes", prompt_server)
-    if not callable(getattr(routes, "get", None)) or not callable(
-        getattr(routes, "post", None)
+    if (
+        not callable(getattr(routes, "get", None))
+        or not callable(getattr(routes, "post", None))
+        or not callable(getattr(routes, "delete", None))
     ):
         raise TypeError("PromptServer does not expose an aiohttp route table")
 
     api = ServerModelDownloaderAPI(
-        models_root=models_root,
-        state_directory=state_directory,
+        settings_state=settings_state,
+        settings=settings,
         signer=signer,
+        authenticator=authenticator,
         job_manager=job_manager,
         job_manager_factory=job_manager_factory,
     )
+    routes.get(f"{API_PREFIX}/health")(api.health)
     routes.get(f"{API_PREFIX}/session")(api.session)
     routes.post(f"{API_PREFIX}/inspect")(api.inspect_models)
     routes.post(f"{API_PREFIX}/jobs")(api.create_jobs)
     routes.get(f"{API_PREFIX}/jobs")(api.list_jobs)
     routes.get(f"{API_PREFIX}/jobs/{{job_id}}")(api.get_job)
     routes.post(f"{API_PREFIX}/jobs/{{job_id}}/cancel")(api.cancel_job)
+    routes.delete(f"{API_PREFIX}/jobs/{{job_id}}/partial")(api.discard_partial)
+    prompt_server._server_model_downloader_api = api
+
+    app = getattr(prompt_server, "app", None)
+    on_startup = getattr(app, "on_startup", None)
+    on_cleanup = getattr(app, "on_cleanup", None)
+    if on_startup is not None and hasattr(on_startup, "append"):
+
+        async def start_downloader(application: Any) -> None:
+            del application
+            await api.runtime.startup()
+
+        on_startup.append(start_downloader)
+    if on_cleanup is not None and hasattr(on_cleanup, "append"):
+
+        async def stop_downloader(application: Any) -> None:
+            del application
+            await api.runtime.shutdown()
+
+        on_cleanup.append(stop_downloader)
     return api
 
 
@@ -754,9 +1165,10 @@ if (
 
 
 __all__ = [
+    "API_COMPAT_PREFIX",
     "API_PREFIX",
-    "DEFAULT_MODELS_ROOT",
-    "DEFAULT_STATE_DIRECTORY",
+    "API_VERSION",
+    "EXTENSION_VERSION",
     "MAX_BODY_BYTES",
     "REGISTERED_API",
     "ServerModelDownloaderAPI",

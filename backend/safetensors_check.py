@@ -5,7 +5,6 @@ import struct
 from pathlib import Path
 from typing import Any
 
-
 MAX_HEADER_BYTES = 100 * 1024 * 1024
 COMMON_DTYPE_BYTES = {
     "BOOL": 1,
@@ -71,15 +70,18 @@ def validate_safetensors_file(path: Path) -> dict[str, Any]:
         offsets = descriptor.get("data_offsets")
         if not isinstance(dtype, str) or not dtype or len(dtype) > 64:
             raise SafeTensorsError(f"invalid dtype for tensor {name!r}")
-        if (
-            not isinstance(shape, list)
-            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in shape)
+        if not isinstance(shape, list) or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in shape
         ):
             raise SafeTensorsError(f"invalid shape for tensor {name!r}")
         if (
             not isinstance(offsets, list)
             or len(offsets) != 2
-            or any(not isinstance(value, int) or isinstance(value, bool) for value in offsets)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in offsets
+            )
         ):
             raise SafeTensorsError(f"invalid data offsets for tensor {name!r}")
         start, end = offsets
@@ -90,7 +92,9 @@ def validate_safetensors_file(path: Path) -> dict[str, Any]:
             for dimension in shape:
                 element_count *= dimension
             if end - start != element_count * COMMON_DTYPE_BYTES[dtype]:
-                raise SafeTensorsError(f"tensor shape does not match byte length for {name!r}")
+                raise SafeTensorsError(
+                    f"tensor shape does not match byte length for {name!r}"
+                )
         intervals.append((start, end, name))
     if tensor_count == 0:
         raise SafeTensorsError("safetensors file contains no tensors")
@@ -115,9 +119,13 @@ def validate_safetensors_file(path: Path) -> dict[str, Any]:
             parsed_keys = list(tensors.keys())
             tensors.metadata()
     except Exception as exc:
-        raise SafeTensorsError(f"official safetensors validation failed: {exc}") from exc
+        raise SafeTensorsError(
+            f"official safetensors validation failed: {exc}"
+        ) from exc
     if len(parsed_keys) != tensor_count:
-        raise SafeTensorsError("official safetensors tensor count does not match header")
+        raise SafeTensorsError(
+            "official safetensors tensor count does not match header"
+        )
     return {
         "size": file_size,
         "header_bytes": header_length,

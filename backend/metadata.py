@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 
 from .security import (
@@ -20,9 +23,9 @@ from .security import (
     validate_source_url,
 )
 
-
 MAX_METADATA_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 8
+METADATA_CACHE_TTL_SECONDS = 5 * 60
 
 
 class MetadataError(ValueError):
@@ -62,8 +65,8 @@ class Candidate:
             "license_url": self.license_url,
         }
 
-    def public_dict(self, signer: TokenSigner) -> dict[str, Any]:
-        token, expires_at = signer.sign(self.token_payload())
+    def public_dict(self, signer: TokenSigner, subject: str) -> dict[str, Any]:
+        token, expires_at = signer.sign_download(self.token_payload(), subject)
         return {
             "provider": self.provider,
             "requested_name": self.requested_name,
@@ -105,7 +108,10 @@ def infer_directory(filename: str, provider_metadata: Mapping[str, Any]) -> str:
     heuristics = (
         (("clip_vision", "vision_encoder"), "clip_vision"),
         (("audio_encoder", "wav2vec"), "audio_encoders"),
-        (("text_encoder", "qwen", "t5xxl", "umt5", "clip_l", "clip_g"), "text_encoders"),
+        (
+            ("text_encoder", "qwen", "t5xxl", "umt5", "clip_l", "clip_g"),
+            "text_encoders",
+        ),
         (("vae", "ae.safetensors", "autoencoder"), "vae"),
         (("lora", "lycoris", "locon"), "loras"),
         (("controlnet", "control_net"), "controlnet"),
@@ -171,8 +177,13 @@ async def safe_fetch_json(session: Any, url: str, provider: str) -> Any:
                 validate_redirect_url(current, provider)
                 continue
             if response.status != 200:
-                body = (await _read_limited(response, 64 * 1024)).decode("utf-8", "replace")
-                raise MetadataError(f"metadata request failed with HTTP {response.status}: {body[:300]}")
+                # Provider bodies can contain account details, request URLs, or
+                # echoed credentials. Keep those details out of browser-safe
+                # exceptions and rely on the status code for remediation.
+                await _read_limited(response, 64 * 1024)
+                raise MetadataError(
+                    f"metadata request failed with HTTP {response.status}"
+                )
             raw = await _read_limited(response)
             try:
                 return json.loads(raw)
@@ -186,8 +197,58 @@ async def safe_fetch_json(session: Any, url: str, provider: str) -> Any:
 class MetadataInspector:
     def __init__(self, signer: TokenSigner):
         self.signer = signer
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._inflight: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._cache_lock: asyncio.Lock | None = None
 
-    async def inspect(self, session: Any, model: Mapping[str, Any]) -> list[dict[str, Any]]:
+    async def _fetch_json(self, session: Any, url: str, provider: str) -> Any:
+        """Deduplicate provider metadata and retain it for a short bounded TTL."""
+
+        if self._cache_lock is None:
+            self._cache_lock = asyncio.Lock()
+        key = (provider, url)
+        now = time.monotonic()
+        async with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(safe_fetch_json(session, url, provider))
+                self._inflight[key] = task
+        try:
+            document = await task
+        except BaseException:
+            async with self._cache_lock:
+                if self._inflight.get(key) is task:
+                    self._inflight.pop(key, None)
+            raise
+        async with self._cache_lock:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+                self._cache[key] = (
+                    time.monotonic() + METADATA_CACHE_TTL_SECONDS,
+                    document,
+                )
+                if len(self._cache) > 256:
+                    expired = [
+                        cache_key
+                        for cache_key, (expires_at, _) in self._cache.items()
+                        if expires_at <= time.monotonic()
+                    ]
+                    for cache_key in expired:
+                        self._cache.pop(cache_key, None)
+                    while len(self._cache) > 256:
+                        self._cache.pop(next(iter(self._cache)))
+        return document
+
+    async def inspect(
+        self,
+        session: Any,
+        model: Mapping[str, Any],
+        *,
+        subject: str,
+    ) -> list[dict[str, Any]]:
         if not isinstance(model, Mapping):
             raise MetadataError("each model must be an object")
         requested_name = validate_filename(model.get("name"))
@@ -203,7 +264,7 @@ class MetadataInspector:
             candidates = await self._inspect_civitai(
                 session, source, requested_name, requested_directory
             )
-        return [candidate.public_dict(self.signer) for candidate in candidates]
+        return [candidate.public_dict(self.signer, subject) for candidate in candidates]
 
     async def _inspect_huggingface(
         self,
@@ -215,13 +276,16 @@ class MetadataInspector:
         assert source.repo_id and source.revision and source.repo_path
         api_url = (
             "https://huggingface.co/api/models/"
-            f"{quote(source.repo_id, safe='/')}/revision/{quote(source.revision, safe='')}?blobs=true"
+            f"{quote(source.repo_id, safe='/')}/revision/"
+            f"{quote(source.revision, safe='')}?blobs=true"
         )
-        document = await safe_fetch_json(session, api_url, "huggingface")
+        document = await self._fetch_json(session, api_url, "huggingface")
         if not isinstance(document, dict):
             raise MetadataError("unexpected Hugging Face metadata")
         resolved_revision = document.get("sha")
-        if not isinstance(resolved_revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved_revision):
+        if not isinstance(resolved_revision, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{40,64}", resolved_revision
+        ):
             raise MetadataError("Hugging Face did not return an immutable revision")
         sibling = None
         for item in document.get("siblings") or []:
@@ -229,20 +293,31 @@ class MetadataInspector:
                 sibling = item
                 break
         if sibling is None:
-            raise MetadataError("file is not present in the Hugging Face repository revision")
+            raise MetadataError(
+                "file is not present in the Hugging Face repository revision"
+            )
         source_filename = validate_filename(source.repo_path.rsplit("/", 1)[-1])
         lfs = sibling.get("lfs") if isinstance(sibling.get("lfs"), dict) else {}
         sha256 = validate_sha256(lfs.get("sha256"))
         size = lfs.get("size") or sibling.get("size")
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise MetadataError("Hugging Face did not provide a valid file size")
-        card_data = document.get("cardData") if isinstance(document.get("cardData"), dict) else {}
+        card_data = (
+            document.get("cardData")
+            if isinstance(document.get("cardData"), dict)
+            else {}
+        )
         license_value: Any = card_data.get("license") or "unknown"
         license_url = card_data.get("license_link")
+        license_host = (
+            (urlsplit(license_url).hostname or "").rstrip(".").lower()
+            if isinstance(license_url, str)
+            else ""
+        )
         if (
             not isinstance(license_url, str)
             or urlsplit(license_url).scheme != "https"
-            or not urlsplit(license_url).hostname
+            or license_host not in {"huggingface.co", "www.huggingface.co"}
         ):
             license_url = f"https://huggingface.co/{source.repo_id}/blob/{resolved_revision}/LICENSE"
         provider_metadata = {
@@ -290,9 +365,11 @@ class MetadataInspector:
     ) -> list[Candidate]:
         assert source.version_id is not None
         version_url = f"https://civitai.com/api/v1/model-versions/{source.version_id}"
-        version = await safe_fetch_json(session, version_url, "civitai")
+        version = await self._fetch_json(session, version_url, "civitai")
         if not isinstance(version, dict) or version.get("id") != source.version_id:
-            raise MetadataError("Civitai model-version metadata did not match the download URL")
+            raise MetadataError(
+                "Civitai model-version metadata did not match the download URL"
+            )
         files = []
         for item in version.get("files") or []:
             if not isinstance(item, dict):
@@ -326,11 +403,14 @@ class MetadataInspector:
             if len(safe_files) == 1:
                 files = safe_files
             else:
-                raise MetadataError("requested filename does not uniquely match a Civitai safetensors file")
+                raise MetadataError(
+                    "requested filename does not uniquely match a Civitai "
+                    "safetensors file"
+                )
         model_id = version.get("modelId")
         model_document: dict[str, Any] = {}
         if isinstance(model_id, int) and not isinstance(model_id, bool):
-            result = await safe_fetch_json(
+            result = await self._fetch_json(
                 session, f"https://civitai.com/api/v1/models/{model_id}", "civitai"
             )
             if isinstance(result, dict):
@@ -341,14 +421,22 @@ class MetadataInspector:
             "allow_derivatives": model_document.get("allowDerivatives"),
             "allow_different_license": model_document.get("allowDifferentLicense"),
         }
+        allow_no_credit = license_details["allow_no_credit"]
+        credit_required: bool | str = (
+            not allow_no_credit if isinstance(allow_no_credit, bool) else "unknown"
+        )
         license_value = (
             "Civitai terms: "
             f"commercial={license_details['allow_commercial_use']}, "
-            f"credit-required={not license_details['allow_no_credit'] if isinstance(license_details['allow_no_credit'], bool) else 'unknown'}, "
+            f"credit-required={credit_required}, "
             f"derivatives={license_details['allow_derivatives']}, "
             f"different-license={license_details['allow_different_license']}"
         )
-        license_url = f"https://civitai.com/models/{model_id}" if isinstance(model_id, int) else None
+        license_url = (
+            f"https://civitai.com/models/{model_id}"
+            if isinstance(model_id, int)
+            else None
+        )
         if len(files) != 1:
             raise MetadataError("requested filename matches more than one Civitai file")
         candidates: list[Candidate] = []
@@ -357,17 +445,35 @@ class MetadataInspector:
             if not isinstance(download_url, str):
                 raise MetadataError("Civitai did not provide a download URL")
             parsed_download = validate_source_url(download_url)
-            if parsed_download.provider != "civitai" or parsed_download.version_id != source.version_id:
-                raise MetadataError("Civitai file URL does not match the inspected model version")
+            if (
+                parsed_download.provider != "civitai"
+                or parsed_download.version_id != source.version_id
+            ):
+                raise MetadataError(
+                    "Civitai file URL does not match the inspected model version"
+                )
             item_id = item.get("id")
             if not isinstance(item_id, int) or isinstance(item_id, bool):
-                raise MetadataError("Civitai file metadata is missing a numeric file id")
-            if parsed_download.file_id is not None and parsed_download.file_id != item_id:
-                raise MetadataError("Civitai download URL fileId does not match API metadata")
+                raise MetadataError(
+                    "Civitai file metadata is missing a numeric file id"
+                )
+            if (
+                parsed_download.file_id is not None
+                and parsed_download.file_id != item_id
+            ):
+                raise MetadataError(
+                    "Civitai download URL fileId does not match API metadata"
+                )
             if source.file_id is not None and source.file_id != item_id:
-                raise MetadataError("requested Civitai fileId does not match API metadata")
+                raise MetadataError(
+                    "requested Civitai fileId does not match API metadata"
+                )
             size_kb = item.get("sizeKB")
-            if not isinstance(size_kb, (int, float)) or isinstance(size_kb, bool) or size_kb <= 0:
+            if (
+                not isinstance(size_kb, (int, float))
+                or isinstance(size_kb, bool)
+                or size_kb <= 0
+            ):
                 raise MetadataError("Civitai did not provide a valid file size")
             size = int(round(float(size_kb) * 1024))
             provider_metadata = {
